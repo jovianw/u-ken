@@ -103,7 +103,7 @@ class ResBlock3D(nn.Module):
 
 
 class UNet3DWithKEM(nn.Module):
-    def __init__(self, in_channels=1, out_channels=1, base_n_filter=64):
+    def __init__(self, in_channels=1, out_channels=1, base_n_filter=64, ncodes=24):
         super(UNet3DWithKEM, self).__init__()
 
         self.enc1 = ResBlock3D(in_channels, base_n_filter)
@@ -117,7 +117,7 @@ class UNet3DWithKEM(nn.Module):
 
         # Bottleneck with KEM
         self.bottleneck = ResBlock3D(base_n_filter * 4, base_n_filter * 8)
-        self.kem = EmbeddingModule3D(base_n_filter * 8)
+        self.kem = EmbeddingModule3D(base_n_filter * 8, ncodes=ncodes)
 
         self.up3 = nn.ConvTranspose3d(
             base_n_filter * 8, base_n_filter * 4, kernel_size=2, stride=2
