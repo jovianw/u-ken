@@ -3,9 +3,9 @@ import numpy as np
 import nibabel as nib
 import argparse
 import os
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader
@@ -13,45 +13,65 @@ from tqdm import tqdm
 from timeit import default_timer as timer
 from copy import deepcopy
 from monai.transforms import Rand3DElasticd
-import argparse
-from models.uken import UNet3DWithKEM
+from models.uken_small import UNet3DWithKEM
 
 
-def dice_loss(preds, labels):
-    """
-    Compute the Dice loss between predictions and labels.
-    preds: Tensor of shape (batch_size, 1, 128, 256, 256)
-    labels: Tensor of shape (batch_size, 128, 256, 256)
-    """
-    # Ensure the predictions are in [0,1] by applying sigmoid
-    preds = torch.sigmoid(preds)
+class DiceLoss(nn.Module):
+    def __init__(self):
+        super(DiceLoss, self).__init__()
 
-    # Remove the channel dimension from preds to match labels' shape
-    preds = preds.squeeze(1)
+    def forward(self, preds, labels):
+        """
+        Compute the Dice loss between predictions and labels.
+        preds: Tensor of shape (batch_size, 1, 128, 256, 256)
+        labels: Tensor of shape (batch_size, 128, 256, 256)
+        """
+        preds = torch.sigmoid(preds)
+        preds = preds.squeeze(1)
 
-    # Calculate intersection and union
-    intersection = (preds * labels).sum(dim=(1, 2, 3))
-    union = preds.sum(dim=(1, 2, 3)) + labels.sum(dim=(1, 2, 3))
+        intersection = (preds * labels).sum(dim=(1, 2, 3))
+        union = preds.sum(dim=(1, 2, 3)) + labels.sum(dim=(1, 2, 3))
 
-    # Compute Dice coefficient and Dice loss
-    dice_coeff = (2.0 * intersection + 1e-6) / (
-        union + 1e-6
-    )  # Adding a small epsilon to avoid division by zero
-    dice_loss = 1 - dice_coeff
+        dice_coeff = (2.0 * intersection + 1e-6) / (union + 1e-6)
+        dice_loss = 1 - dice_coeff
 
-    # Return the average Dice loss over the batch
-    return dice_loss.mean()
+        return dice_loss.mean()
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Assume inputs are raw logits for binary classification
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        targets = targets.type(torch.float32)
+        at = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        pt = torch.exp(-BCE_loss)
+        F_loss = at * (1 - pt) ** self.gamma * BCE_loss
+
+        if self.reduction == "mean":
+            return torch.mean(F_loss)
+        elif self.reduction == "sum":
+            return torch.sum(F_loss)
+        else:
+            return F_loss
 
 
 def save_checkpoint(snapshot_dir, epoch_num, history, best_model, curr_model):
     # Save history
-    save_history_path = os.path.join(snapshot_dir, f"epoch_{epoch_num}_history.npz")
+    save_history_path = os.path.join(
+        snapshot_dir, f"small_epoch_{epoch_num}_history.npz"
+    )
     np.savez_compressed(save_history_path, history=history)
     # Save best model
-    best_model_path = os.path.join(snapshot_dir, f"epoch_{epoch_num}_best.pth")
+    best_model_path = os.path.join(snapshot_dir, f"small_epoch_{epoch_num}_best.pth")
     torch.save(best_model, best_model_path)
     # Save current model
-    save_model_path = os.path.join(snapshot_dir, f"epoch_{epoch_num}.pth")
+    save_model_path = os.path.join(snapshot_dir, f"small_epoch_{epoch_num}.pth")
     torch.save(curr_model, save_model_path)
     print(f"Saved model to {save_model_path}, {best_model_path}")
 
@@ -74,7 +94,6 @@ class DeepLesion_dataset(Dataset):
             self.sample_list = self.sample_list[:clip]
         self.image_dir = image_dir
         self.label_dir = label_dir
-        print(self.image_dir, self.sample_list)
 
     def __len__(self):
         return len(self.sample_list)
@@ -130,11 +149,11 @@ parser.add_argument(
     "--max_epoch", type=int, default=300, help="maximum epoch number to train"
 )
 parser.add_argument(
-    "--patience", type=int, default=10, help="num epochs before early stopping"
+    "--patience", type=int, default=50, help="num epochs before early stopping"
 )
 parser.add_argument("--clip", type=int, default=-1, help="number of slices to clip")
 parser.add_argument("--batch_size", type=int, default=1, help="batch_size")
-parser.add_argument("--ncodes", type=int, default=24, help="number of codes for KEM")
+parser.add_argument("--ncodes", type=int, default=8, help="number of codes for KEM")
 args = parser.parse_args()
 
 image_dir = args.image_dir
@@ -182,8 +201,10 @@ valloader = DataLoader(db_val, batch_size=batch_size, shuffle=True)
 
 optimizer = optim.Adam(model.parameters(), lr=base_lr)
 scheduler = ReduceLROnPlateau(
-    optimizer, mode="min", factor=0.1, patience=10, verbose=True
+    optimizer, mode="min", factor=0.1, patience=4, verbose=True
 )
+dice_loss = DiceLoss()
+# focal_loss = FocalLoss()
 
 # Make snapshots dir
 if not os.path.exists(snapshot_dir):
@@ -202,6 +223,7 @@ iterator = tqdm(range(max_epoch), ncols=100)
 for epoch_num in iterator:
     start = timer()
     total_train_loss = 0.0
+    total_train_dice = 0.0
 
     # Training loop
     model.train()
@@ -209,11 +231,15 @@ for epoch_num in iterator:
         image_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
         image_batch, label_batch = image_batch.to(device), label_batch.to(device)
         outputs = model(image_batch)
-        loss = dice_loss(outputs, label_batch)
+        loss_dice = dice_loss(outputs, label_batch)
+        # loss_focal = focal_loss(outputs.squeeze(1), label_batch.squeeze(1).float())
+        # loss = 0.3 * loss_focal + 0.7 * loss_dice
+        loss = loss_dice
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         total_train_loss += loss.item()
+        total_train_dice += loss_dice.item()
 
         # Track training progress
         print(
@@ -222,20 +248,27 @@ for epoch_num in iterator:
         )
 
     avg_train_loss = total_train_loss / len(trainloader)
+    avg_train_dice = total_train_dice / len(trainloader)
 
     # Validation loop
     model.eval()  # Set the model to evaluation mode
     total_val_loss = 0.0
+    total_val_dice = 0.0
     with torch.no_grad():  # No need to track gradients during validation
         for i_batch, sampled_batch in enumerate(valloader):
             image_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
             image_batch, label_batch = image_batch.to(device), label_batch.to(device)
             outputs = model(image_batch)
-            loss = dice_loss(outputs, label_batch)
+            loss_dice = dice_loss(outputs, label_batch)
+            # loss_focal = focal_loss(outputs.squeeze(1), label_batch.squeeze(1).float())
+            # loss = 0.3 * loss_focal + 0.7 * loss_dice
+            loss = loss_dice
             total_val_loss += loss.item()
+            total_val_dice += loss_dice.item()
 
     avg_val_loss = total_val_loss / len(valloader)
-    history.append([avg_train_loss, avg_val_loss])
+    avg_val_dice = total_val_dice / len(valloader)
+    history.append([avg_train_loss, avg_val_loss, avg_train_dice, avg_val_dice])
 
     scheduler.step(avg_val_loss)
 

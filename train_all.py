@@ -8,13 +8,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.nn import BCEWithLogitsLoss
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from timeit import default_timer as timer
 from copy import deepcopy
 from monai.transforms import Rand3DElasticd
 import argparse
-from models.uken import UNet3DWithKEM
+from models.uken_small import UNet3DWithKEM
+import time
 
 
 def dice_loss(preds, labels):
@@ -44,45 +46,50 @@ def dice_loss(preds, labels):
 
 
 def save_checkpoint(snapshot_dir, epoch_num, history, best_model, curr_model):
+    timestr = time.strftime("%m%d-%H%M")
     # Save history
-    save_history_path = os.path.join(snapshot_dir, f"epoch_{epoch_num}_history.npz")
+    save_history_path = os.path.join(
+        snapshot_dir, f"epoch_{epoch_num}_history_{timestr}.npz"
+    )
     np.savez_compressed(save_history_path, history=history)
     # Save best model
-    best_model_path = os.path.join(snapshot_dir, f"epoch_{epoch_num}_best.pth")
+    best_model_path = os.path.join(
+        snapshot_dir, f"epoch_{epoch_num}_best_{timestr}.pth"
+    )
     torch.save(best_model, best_model_path)
     # Save current model
-    save_model_path = os.path.join(snapshot_dir, f"epoch_{epoch_num}.pth")
+    save_model_path = os.path.join(snapshot_dir, f"epoch_{epoch_num}_{timestr}.pth")
     torch.save(curr_model, save_model_path)
     print(f"Saved model to {save_model_path}, {best_model_path}")
 
 
-class DeepLesion_dataset(Dataset):
+class All_dataset(Dataset):
     """
     Assumes that labels are already unzipped
     """
 
-    def __init__(self, image_dir, label_dir, list_dir, split, clip=-1, transform=None):
+    def __init__(self, datasets_dir, list_dir, split, clip=-1, transform=None):
         self.transform = transform
         self.split = split
         self.sample_list = [
-            line.strip("\n")
-            for line in open(
-                os.path.join(list_dir, "deeplesion_" + self.split + ".txt")
-            )
+            line.strip("\n").split(" ")
+            for line in open(os.path.join(list_dir, "all_" + self.split + ".txt"))
         ]
         if clip > 0:
             self.sample_list = self.sample_list[:clip]
-        self.image_dir = image_dir
-        self.label_dir = label_dir
-        print(self.image_dir, self.sample_list)
+        self.datasets_dir = datasets_dir
 
     def __len__(self):
         return len(self.sample_list)
 
     def __getitem__(self, idx):
-        filename = self.sample_list[idx]
-        image_path = os.path.join(self.image_dir, filename + "_lesion_01.nii.gz")
-        label_path = os.path.join(self.label_dir, filename + "_lesion_01.nii.gz")
+        subfolder, filename = self.sample_list[idx][0], self.sample_list[idx][1]
+        image_path = os.path.join(
+            self.datasets_dir, subfolder, "images", filename + ".nii.gz"
+        )
+        label_path = os.path.join(
+            self.datasets_dir, subfolder, "labels", filename + ".nii.gz"
+        )
         image = nib.load(image_path).get_fdata()
         label = nib.load(label_path).get_fdata()
         image = np.expand_dims(np.moveaxis(np.squeeze(image), 2, 0), axis=0)
@@ -100,22 +107,16 @@ class DeepLesion_dataset(Dataset):
 # Setup our own args
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--image_dir",
+    "--datasets_dir",
     type=str,
-    default="datasets/ULS23_DeepLesion3D/images",
-    help="dir for images",
-)
-parser.add_argument(
-    "--label_dir",
-    type=str,
-    default="datasets/ULS23_DeepLesion3D/labels",
-    help="dir for validation slices",
+    default="datasets",
+    help="dir for ULS23 datasets",
 )
 parser.add_argument(
     "--list_dir",
     type=str,
     default="datasets",
-    help="dir for validation slices",
+    help="dir for split list text files",
 )
 parser.add_argument(
     "--snapshot_dir",
@@ -124,7 +125,7 @@ parser.add_argument(
     help="dir for model and data snapshots",
 )
 parser.add_argument(
-    "--base_lr", type=float, default=0.05, help="segmentation network learning rate"
+    "--base_lr", type=float, default=0.005, help="segmentation network learning rate"
 )
 parser.add_argument(
     "--max_epoch", type=int, default=300, help="maximum epoch number to train"
@@ -134,11 +135,10 @@ parser.add_argument(
 )
 parser.add_argument("--clip", type=int, default=-1, help="number of slices to clip")
 parser.add_argument("--batch_size", type=int, default=1, help="batch_size")
-parser.add_argument("--ncodes", type=int, default=24, help="number of codes for KEM")
+parser.add_argument("--ncodes", type=int, default=8, help="number of codes for KEM")
 args = parser.parse_args()
 
-image_dir = args.image_dir
-label_dir = args.label_dir
+datasets_dir = args.datasets_dir
 list_dir = args.list_dir
 snapshot_dir = args.snapshot_dir
 base_lr = args.base_lr
@@ -167,30 +167,26 @@ transform = Rand3DElasticd(
     padding_mode="border",
 )
 
-db_train = DeepLesion_dataset(
-    image_dir, label_dir, list_dir, "train", transform=transform
-)
-db_val = DeepLesion_dataset(image_dir, label_dir, list_dir, "val", transform=transform)
-db_test = DeepLesion_dataset(
-    image_dir, label_dir, list_dir, "test", transform=transform
-)
+db_train = All_dataset(datasets_dir, list_dir, "train", transform=transform)
+db_val = All_dataset(datasets_dir, list_dir, "val", transform=transform)
+db_test = All_dataset(datasets_dir, list_dir, "test", transform=transform)
 print("The length of train set is: {}".format(len(db_train)))
 print("The length of val set is: {}".format(len(db_val)))
+print("The length of test set is: {}".format(len(db_test)))
 
 trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True)
 valloader = DataLoader(db_val, batch_size=batch_size, shuffle=True)
 
 optimizer = optim.Adam(model.parameters(), lr=base_lr)
 scheduler = ReduceLROnPlateau(
-    optimizer, mode="min", factor=0.1, patience=10, verbose=True
+    optimizer, mode="min", factor=0.1, patience=3, verbose=True
 )
 
 # Make snapshots dir
 if not os.path.exists(snapshot_dir):
     os.makedirs(snapshot_dir)
 
-
-max_iterations = max_epoch * len(trainloader)
+bce_loss = BCEWithLogitsLoss()
 best_val_loss = float("inf")
 overall_start = timer()
 history = []
@@ -209,7 +205,9 @@ for epoch_num in iterator:
         image_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
         image_batch, label_batch = image_batch.to(device), label_batch.to(device)
         outputs = model(image_batch)
-        loss = dice_loss(outputs, label_batch)
+        loss_bce = bce_loss(outputs.squeeze(1), label_batch)
+        loss_dice = dice_loss(outputs, label_batch)
+        loss = 0.4 * loss_bce + 0.6 * loss_dice
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -231,7 +229,9 @@ for epoch_num in iterator:
             image_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
             image_batch, label_batch = image_batch.to(device), label_batch.to(device)
             outputs = model(image_batch)
-            loss = dice_loss(outputs, label_batch)
+            loss_bce = bce_loss(outputs.squeeze(1), label_batch)
+            loss_dice = dice_loss(outputs, label_batch)
+            loss = 0.4 * loss_bce + 0.6 * loss_dice
             total_val_loss += loss.item()
 
     avg_val_loss = total_val_loss / len(valloader)
